@@ -21,9 +21,13 @@ python3.10 -m venv .venv
 source .venv/bin/activate
 
 echo "[3/7] Installing Python dependencies…"
-python -m pip install --upgrade pip setuptools wheel
-python -m pip install -r requirements.txt
-python -m pip install -r requirements-copilot.txt
+python -m pip install --upgrade pip wheel
+# hdlparse needs setuptools<58 (use_2to3 removed in setuptools 58+)
+python -m pip install setuptools==57.5.0
+python -m pip install hdlparse==1.0.4 --no-build-isolation
+echo "setuptools<58" > /tmp/pip-constraints.txt
+python -m pip install -c /tmp/pip-constraints.txt -r requirements.txt
+python -m pip install -c /tmp/pip-constraints.txt -r requirements-copilot.txt
 
 echo "[4/7] Installing PaddlePaddle (CPU, AVX, MKL)…"
 python -m pip install "paddlepaddle==2.5.2" \
