@@ -89,31 +89,50 @@ def ingest_pdfs(manuals_directory: str) -> None:
 
 # ==================== SEARCH ====================
 
+# Relevance threshold: ChromaDB returns distances (L2 or cosine).
+# Lower distance = more similar. Filter out chunks with distance > threshold.
+RELEVANCE_THRESHOLD = float(os.environ.get("ESIM_RAG_RELEVANCE_THRESHOLD", "1.0"))
+
+
 def search_knowledge(query: str, n_results: int = 4) -> str:
     """
-    Simple semantic search against the single master knowledge file.
+    Semantic search with relevance threshold to reduce hallucination.
+    Filters out chunks with distance > RELEVANCE_THRESHOLD.
     """
     try:
-        # Generate embedding for the user's question
         query_embed = get_embedding(query)
         if not query_embed:
             return ""
 
-        # Query the database
         results = collection.query(
             query_embeddings=[query_embed],
             n_results=n_results,
+            include=["documents", "distances"],
         )
 
-        docs_list = results.get("documents", [])
-        
+        docs_list = results.get("documents", [[]])
+        distances_list = results.get("distances", [[]])
+
         if not docs_list or not docs_list[0]:
-            print("DEBUG: No relevant info found.")
             return ""
 
-        selected_chunks = docs_list[0]
-        context_text = "\n\n...\n\n".join(selected_chunks)
+        docs = docs_list[0]
+        distances = distances_list[0] if distances_list else []
 
+        # Filter by relevance threshold (lower distance = more similar)
+        if distances and len(distances) == len(docs):
+            filtered = [
+                (doc, d) for doc, d in zip(docs, distances)
+                if d <= RELEVANCE_THRESHOLD
+            ]
+            if filtered:
+                selected_chunks = [doc for doc, _ in filtered]
+            else:
+                return ""
+        else:
+            selected_chunks = docs
+
+        context_text = "\n\n...\n\n".join(selected_chunks)
         if len(context_text) > 3500:
             context_text = context_text[:3500]
 

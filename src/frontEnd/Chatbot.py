@@ -10,16 +10,23 @@ from PyQt5.QtWidgets import (
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
 from PyQt5.QtGui import QFont
-MANUALS_DIR = os.path.join(os.path.dirname(__file__), "manuals")
+# Try multiple paths for netlist contract (frontEnd/manual, frontEnd/manuals, src/manuals)
+_CONTRACT_PATHS = [
+    os.path.join(os.path.dirname(__file__), "manual", "esim_netlist_analysis_output_contract.txt"),
+    os.path.join(os.path.dirname(__file__), "manuals", "esim_netlist_analysis_output_contract.txt"),
+    os.path.join(os.path.dirname(os.path.dirname(__file__)), "manuals", "esim_netlist_analysis_output_contract.txt"),
+]
 NETLIST_CONTRACT = ""
-
-try:
-    contract_path = os.path.join(MANUALS_DIR, "esim_netlist_analysis_output_contract.txt")
-    with open(contract_path, "r", encoding="utf-8") as f:
-        NETLIST_CONTRACT = f.read()
-        print(f"[COPILOT] Loaded netlist contract from {contract_path}")
-except Exception as e:
-    print(f"[COPILOT] WARNING: Could not load netlist contract: {e}")
+for contract_path in _CONTRACT_PATHS:
+    try:
+        with open(contract_path, "r", encoding="utf-8") as f:
+            NETLIST_CONTRACT = f.read()
+            print(f"[COPILOT] Loaded netlist contract from {contract_path}")
+            break
+    except Exception:
+        continue
+if not NETLIST_CONTRACT:
+    print("[COPILOT] Using fallback netlist contract (file not found in any path)")
     NETLIST_CONTRACT = (
         "You are a SPICE netlist analyzer.\n"
         "Use the FACT lines to detect issues.\n"
@@ -519,6 +526,7 @@ class ChatbotGUI(QWidget):
         # Project context
         self._project_dir = None
         self._generation_id = 0  # used to ignore stale responses
+        self._last_assistant_response = ""  # for Copy button
 
         self.initUI()
     
@@ -1046,6 +1054,26 @@ class ChatbotGUI(QWidget):
         self.analyze_netlist_btn.clicked.connect(self.analyze_current_netlist)
         header_layout.addWidget(self.analyze_netlist_btn)
 
+        # Copy button (copy last assistant response to clipboard)
+        self.copy_btn = QPushButton("📋")
+        self.copy_btn.setFixedSize(30, 30)
+        self.copy_btn.setToolTip("Copy last response to clipboard")
+        self.copy_btn.setCursor(Qt.PointingHandCursor)
+        self.copy_btn.setStyleSheet("""
+            QPushButton {
+                background-color: transparent;
+                border: 1px solid #ddd;
+                border-radius: 15px;
+                font-size: 14px;
+            }
+            QPushButton:hover {
+                background-color: #e3f2fd;
+                border-color: #2196f3;
+            }
+        """)
+        self.copy_btn.clicked.connect(self.copy_last_response)
+        header_layout.addWidget(self.copy_btn)
+
         # Clear button
         self.clear_btn = QPushButton("🗑️")
         self.clear_btn.setFixedSize(30, 30)
@@ -1430,10 +1458,29 @@ class ChatbotGUI(QWidget):
         text = text.replace('\n', '<br>')
         return text
 
+    def copy_last_response(self):
+        """Copy last assistant response to clipboard for easy paste into netlist."""
+        if self._last_assistant_response:
+            cb = QApplication.clipboard()
+            cb.setText(self._last_assistant_response)
+            QMessageBox.information(
+                self, "Copied",
+                "Last response copied to clipboard. Paste into Spice Editor (Ctrl+V).",
+                QMessageBox.Ok,
+            )
+        else:
+            QMessageBox.information(
+                self, "Nothing to copy",
+                "No assistant response yet. Run a netlist analysis or ask a question first.",
+                QMessageBox.Ok,
+            )
+
     def append_message(self, sender, text, is_user):
         """Append message INSTANTLY (Text Only, No Image Rendering)."""
         if not text:
             return
+        if not is_user:
+            self._last_assistant_response = text
 
         # 1. Define Headers
         if is_user:
