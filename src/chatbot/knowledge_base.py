@@ -4,8 +4,14 @@ from .ollama_runner import get_embedding
 
 # ==================== DATABASE SETUP ====================
 
-# Persistent DB directory (relative to this file)
-db_path = os.path.join(os.path.dirname(__file__), "esim_knowledge_db")
+def _default_db_path() -> str:
+    xdg_data_home = os.environ.get("XDG_DATA_HOME", "").strip()
+    if not xdg_data_home:
+        xdg_data_home = os.path.join(os.path.expanduser("~"), ".local", "share")
+    return os.path.join(xdg_data_home, "esim-copilot", "chroma")
+
+db_path = os.environ.get("ESIM_COPILOT_DB_PATH", "").strip() or _default_db_path()
+os.makedirs(db_path, exist_ok=True)
 chroma_client = chromadb.PersistentClient(path=db_path)
 
 collection = chroma_client.get_or_create_collection(name="esim_manuals")

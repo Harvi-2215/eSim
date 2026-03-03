@@ -3,16 +3,36 @@ import json
 import queue
 import time
 
-import sounddevice as sd
-from vosk import Model, KaldiRecognizer
+try:
+    import sounddevice as sd
+    from vosk import Model, KaldiRecognizer
+    _HAS_STT = True
+except Exception:
+    sd = None
+    Model = None
+    KaldiRecognizer = None
+    _HAS_STT = False
 
 _MODEL = None
 
+DEFAULT_VOSK_DIR = os.path.join(
+    os.path.expanduser("~"), ".local", "share",
+    "esim-copilot", "vosk-model-small-en-us-0.15",
+)
+
 def _get_model():
     global _MODEL
-    model_path = os.environ.get("VOSK_MODEL_PATH", "")
-    if not model_path or not os.path.isdir(model_path):
-        raise RuntimeError(f"VOSK_MODEL_PATH not set or not found: {model_path}")
+    if not _HAS_STT:
+        raise RuntimeError(
+            "Speech-to-text is not available (missing vosk/sounddevice)."
+        )
+    model_path = os.environ.get("VOSK_MODEL_PATH", "").strip()
+    if not model_path:
+        model_path = DEFAULT_VOSK_DIR
+    if not os.path.isdir(model_path):
+        raise RuntimeError(
+            f"Vosk model path not found. Set VOSK_MODEL_PATH or install at: {model_path}"
+        )
     if _MODEL is None:
         _MODEL = Model(model_path)
     return _MODEL
@@ -22,6 +42,8 @@ def listen_to_mic(should_stop=lambda: False, max_silence_sec=3, samplerate=16000
     Offline STT using Vosk.
     Returns recognized text, or "" if cancelled / timed out.
     """
+    if not _HAS_STT:
+        raise RuntimeError("Speech-to-text is not installed or failed to load.")
     q = queue.Queue()
     rec = KaldiRecognizer(_get_model(), samplerate)
 

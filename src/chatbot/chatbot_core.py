@@ -4,7 +4,6 @@ import os
 import re
 import json
 from typing import Dict, Any, Tuple, List
-from sklearn.metrics.pairwise import cosine_similarity
 from .error_solutions import get_error_solution
 from .image_handler import analyze_and_extract
 from .ollama_runner import run_ollama

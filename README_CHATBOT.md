@@ -4,6 +4,8 @@ eSim Copilot is an AI-powered assistant integrated into **eSim**, designed to he
 
 This project combines **PyQt5**, **ngspice**, **Ollama (LLMs)**, **RAG (ChromaDB)**, **OCR**, and **offline speech-to-text** into a single desktop application.
 
+**→ First-time deployment on Ubuntu (VM or WSL2): see [DEPLOY_UBUNTU.md](DEPLOY_UBUNTU.md)**
+
 ---
 
 ## Key Features
