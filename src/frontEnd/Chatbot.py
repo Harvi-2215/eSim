@@ -6,9 +6,10 @@ from chatbot.stt_handler import listen_to_mic
 from PyQt5.QtGui import QTextCursor
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QTextEdit, QLineEdit,
-    QPushButton, QLabel, QFileDialog, QMessageBox, QApplication, QWidget
+    QPushButton, QLabel, QFileDialog, QMessageBox, QApplication,
+    QDialog, QComboBox, QFormLayout, QSizePolicy,
 )
-from PyQt5.QtCore import Qt, QThread, pyqtSignal
+from PyQt5.QtCore import Qt, QThread, QTimer, pyqtSignal
 from PyQt5.QtGui import QFont
 # Try multiple paths for netlist contract (frontEnd/manual, frontEnd/manuals, src/manuals)
 _CONTRACT_PATHS = [
@@ -514,6 +515,79 @@ class MicWorker(QThread):
         except Exception as e:
             self.error_occurred.emit(f"[Error: {e}]")
 
+# ==================== BATCH WORKER ====================
+
+class BatchWorker(QThread):
+    """Runs static FACT analysis on multiple netlists or vision on images — no LLM."""
+    file_started = pyqtSignal(int, int, str)   # idx, total, filename
+    file_done    = pyqtSignal(int, int, str, str)  # idx, total, filename, summary
+    all_done     = pyqtSignal(list)            # list of (filename, summary)
+
+    def __init__(self, mode: str, file_paths: list):
+        super().__init__()
+        self.mode = mode          # "netlist" or "image"
+        self.file_paths = file_paths
+
+    def run(self):
+        results = []
+        total = len(self.file_paths)
+        for i, path in enumerate(self.file_paths):
+            name = os.path.basename(path)
+            self.file_started.emit(i + 1, total, name)
+            if self.mode == "netlist":
+                summary = self._analyze_netlist(path)
+            else:
+                summary = self._analyze_image(path)
+            results.append((name, summary))
+            self.file_done.emit(i + 1, total, name, summary)
+        self.all_done.emit(results)
+
+    def _analyze_netlist(self, path: str) -> str:
+        try:
+            with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                text = f.read()
+            floating   = _detect_floating_nodes(text)
+            missing_m  = _detect_missing_models(text)
+            missing_s  = _detect_missing_subcircuits(text)
+            conflicts  = _detect_voltage_source_conflicts(text)
+            has_n0, has_gnd = _netlist_ground_info(text)
+            issues = []
+            if not has_n0 and not has_gnd:
+                issues.append("No ground ref")
+            if floating:
+                issues.append(f"{len(floating)} floating node(s): " +
+                              ", ".join(n for n, _, _ in floating[:3]))
+            if missing_m:
+                issues.append(f"{len(missing_m)} missing model(s): " +
+                              ", ".join(m for m, _ in missing_m[:3]))
+            if missing_s:
+                issues.append(f"{len(missing_s)} missing subckt(s): " +
+                              ", ".join(s for s, _ in missing_s[:3]))
+            if conflicts:
+                issues.append(f"{len(conflicts)} voltage conflict(s)")
+            return "; ".join(issues) if issues else "OK — no static issues found"
+        except Exception as e:
+            return f"Error reading file: {e}"
+
+    def _analyze_image(self, path: str) -> str:
+        try:
+            from chatbot.image_handler import analyze_and_extract
+            result = analyze_and_extract(path)
+            if result.get("error"):
+                return f"Vision error: {result['error']}"
+            ctype      = result.get("circuit_analysis", {}).get("circuit_type", "Unknown")
+            components = result.get("components", [])
+            errors     = result.get("circuit_analysis", {}).get("design_errors", [])
+            summary    = f"Type: {ctype}; Components: {', '.join(components[:5])}"
+            if errors:
+                summary += f"; Errors: {'; '.join(errors[:2])}"
+            return summary
+        except Exception as e:
+            return f"Error: {e}"
+
+
+# ==================== MAIN CHATBOT GUI ====================
+
 class ChatbotGUI(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -521,12 +595,25 @@ class ChatbotGUI(QWidget):
         self.current_image_path = None
         self.worker = None
         self._mic_worker = None
+        self._batch_worker = None
         self._is_listening = False
 
         # Project context
         self._project_dir = None
         self._generation_id = 0  # used to ignore stale responses
         self._last_assistant_response = ""  # for Copy button
+
+        # One-click fix state
+        self._last_netlist_path = None
+        self._last_facts = {}
+        self._pending_fix_check = None   # set during netlist analysis
+
+        # Real-time hints watcher
+        self._watch_active = False
+        self._watch_last_facts = None
+        self._watch_timer = QTimer(self)
+        self._watch_timer.setInterval(30_000)  # 30 s
+        self._watch_timer.timeout.connect(self._kicad_watch_tick)
 
         self.initUI()
     
@@ -747,6 +834,18 @@ class ChatbotGUI(QWidget):
         )
 
 
+        # Store facts for one-click fix
+        facts_dict = {
+            "syntax_valid":     is_syntax_valid,
+            "has_node0":        has_node0,
+            "has_gnd_label":    has_gnd_label,
+            "floating_nodes":   floating_desc,
+            "missing_models":   missing_desc,
+            "missing_subckts":  subckt_desc,
+            "voltage_conflicts": voltage_conflict_desc,
+        }
+        self._pending_fix_check = (netlist_path, facts_dict)
+
         # Show synthetic user message
         self.append_message(
             "You",
@@ -914,6 +1013,18 @@ class ChatbotGUI(QWidget):
             "- Follow the output format and rules described in the contract above.\n"
         )
 
+        # Store facts for one-click fix
+        facts_dict = {
+            "syntax_valid":     is_syntax_valid,
+            "has_node0":        has_node0,
+            "has_gnd_label":    has_gnd_label,
+            "floating_nodes":   floating_desc,
+            "missing_models":   missing_desc,
+            "missing_subckts":  subckt_desc,
+            "voltage_conflicts": voltage_conflict_desc,
+        }
+        self._pending_fix_check = (netlist_path, facts_dict)
+
         # Show synthetic user message
         self.append_message(
             "You",
@@ -1074,6 +1185,57 @@ class ChatbotGUI(QWidget):
         self.copy_btn.clicked.connect(self.copy_last_response)
         header_layout.addWidget(self.copy_btn)
 
+        # Settings button
+        self.settings_btn = QPushButton("⚙️")
+        self.settings_btn.setFixedSize(30, 30)
+        self.settings_btn.setToolTip("Model settings (text & vision model selection)")
+        self.settings_btn.setCursor(Qt.PointingHandCursor)
+        self.settings_btn.setStyleSheet("""
+            QPushButton {
+                background-color: transparent;
+                border: 1px solid #ddd;
+                border-radius: 15px;
+                font-size: 14px;
+            }
+            QPushButton:hover { background-color: #e8f5e9; border-color: #4caf50; }
+        """)
+        self.settings_btn.clicked.connect(self.open_settings)
+        header_layout.addWidget(self.settings_btn)
+
+        # Batch analysis button
+        self.batch_btn = QPushButton("📁")
+        self.batch_btn.setFixedSize(30, 30)
+        self.batch_btn.setToolTip("Batch analyze multiple netlists or images")
+        self.batch_btn.setCursor(Qt.PointingHandCursor)
+        self.batch_btn.setStyleSheet("""
+            QPushButton {
+                background-color: transparent;
+                border: 1px solid #ddd;
+                border-radius: 15px;
+                font-size: 14px;
+            }
+            QPushButton:hover { background-color: #fff3e0; border-color: #ff9800; }
+        """)
+        self.batch_btn.clicked.connect(self.analyze_batch_files)
+        header_layout.addWidget(self.batch_btn)
+
+        # Real-time hints watcher button
+        self.watch_btn = QPushButton("👁")
+        self.watch_btn.setFixedSize(30, 30)
+        self.watch_btn.setToolTip("Toggle real-time hints (polls active project every 30 s)")
+        self.watch_btn.setCursor(Qt.PointingHandCursor)
+        self.watch_btn.setStyleSheet("""
+            QPushButton {
+                background-color: transparent;
+                border: 1px solid #ddd;
+                border-radius: 15px;
+                font-size: 14px;
+            }
+            QPushButton:hover { background-color: #e3f2fd; border-color: #2196f3; }
+        """)
+        self.watch_btn.clicked.connect(self.toggle_kicad_watch)
+        header_layout.addWidget(self.watch_btn)
+
         # Clear button
         self.clear_btn = QPushButton("🗑️")
         self.clear_btn.setFixedSize(30, 30)
@@ -1123,6 +1285,27 @@ class ChatbotGUI(QWidget):
         """)
         self.loading_label.hide()
         self.layout.addWidget(self.loading_label)
+
+        # --- ONE-CLICK FIX BUTTON (hidden until issues detected) ---
+        self._apply_fixes_btn = QPushButton("🔧 Apply Fixes to Netlist")
+        self._apply_fixes_btn.setFixedHeight(32)
+        self._apply_fixes_btn.setCursor(Qt.PointingHandCursor)
+        self._apply_fixes_btn.setToolTip(
+            "Auto-insert .options, .model stubs, and bleed resistors into the netlist"
+        )
+        self._apply_fixes_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #e74c3c;
+                color: white;
+                border-radius: 6px;
+                font-weight: bold;
+                font-size: 12px;
+            }
+            QPushButton:hover { background-color: #c0392b; }
+        """)
+        self._apply_fixes_btn.clicked.connect(self._apply_netlist_fixes)
+        self._apply_fixes_btn.hide()
+        self.layout.addWidget(self._apply_fixes_btn)
 
         # --- INPUT AREA CONTAINER ---
         input_layout = QHBoxLayout()
@@ -1353,6 +1536,11 @@ class ChatbotGUI(QWidget):
         if not user_text and not self.current_image_path:
             return
 
+        # Hide fix button when user sends a new message
+        if hasattr(self, "_apply_fixes_btn"):
+            self._apply_fixes_btn.hide()
+        self._pending_fix_check = None
+
         full_query = user_text
         display_text = user_text
 
@@ -1418,14 +1606,19 @@ class ChatbotGUI(QWidget):
             self.attach_btn.setEnabled(True)
         if hasattr(self, 'mic_btn'):
             self.mic_btn.setEnabled(True)
-
-        # NEW: re-enable Netlist and Clear
         if hasattr(self, "analyze_netlist_btn"):
             self.analyze_netlist_btn.setEnabled(True)
         if hasattr(self, "clear_btn"):
             self.clear_btn.setEnabled(True)
 
         self.loading_label.hide()
+
+        # Check whether to show the Apply Fixes button
+        if self._pending_fix_check:
+            path, facts = self._pending_fix_check
+            self._pending_fix_check = None
+            self._check_show_fixes_btn(path, facts)
+
         self.input_field.setFocus()
 
     def _handle_response_with_id(self, response: str, gen_id: int):
@@ -1504,19 +1697,354 @@ class ChatbotGUI(QWidget):
         self.chat_display.setTextCursor(cursor)
         self.chat_display.ensureCursorVisible()
 
+    # ==================== PRIORITY 3: ONE-CLICK FIX ====================
+
+    def _check_show_fixes_btn(self, netlist_path: str, facts: dict):
+        """Show the Apply Fixes button if there are auto-fixable issues."""
+        self._last_netlist_path = netlist_path
+        self._last_facts = facts
+        has_fixes = (
+            (facts.get("missing_models",   "NONE") not in ("NONE", "")) or
+            (facts.get("floating_nodes",   "NONE") not in ("NONE", "")) or
+            (not facts.get("has_node0") and not facts.get("has_gnd_label"))
+        )
+        if has_fixes:
+            self._apply_fixes_btn.show()
+        else:
+            self._apply_fixes_btn.hide()
+
+    def _apply_netlist_fixes(self):
+        """Auto-insert fixes (options, model stubs, bleed resistors) into netlist."""
+        path  = self._last_netlist_path
+        facts = self._last_facts
+
+        if not path or not os.path.exists(path):
+            QMessageBox.warning(self, "No netlist",
+                                "No recently analyzed netlist found. Run a netlist analysis first.")
+            return
+
+        try:
+            with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                lines = f.readlines()
+        except Exception as e:
+            QMessageBox.warning(self, "Read error", f"Cannot read netlist:\n{e}")
+            return
+
+        insertions = []
+        applied    = []
+
+        # 1. Convergence options (safe when no .options present)
+        has_options = any(".options" in l.lower() for l in lines)
+        if not has_options:
+            insertions.append(".options gmin=1e-12 reltol=0.01\n")
+            applied.append("Added `.options gmin=1e-12 reltol=0.01` (convergence helper)")
+
+        # 2. Missing model stubs
+        missing_str = facts.get("missing_models", "NONE")
+        if missing_str and missing_str != "NONE":
+            for part in missing_str.split(";"):
+                part = part.strip()
+                model_name = part.split("(")[0].strip() if "(" in part else part
+                model_name = model_name.strip()
+                if model_name and model_name.upper() != "NONE":
+                    stub = _model_stub(model_name)
+                    insertions.append(stub + "\n")
+                    applied.append(f"Added stub: {stub}")
+
+        # 3. Floating-node bleed resistors
+        floating_str = facts.get("floating_nodes", "NONE")
+        if floating_str and floating_str != "NONE":
+            for part in floating_str.split(";"):
+                node = part.strip().split(" ")[0].split("(")[0].strip()
+                if node and node != "0" and node.upper() != "NONE":
+                    line = f"Rleak_{node} {node} 0 1G\n"
+                    insertions.append(line)
+                    applied.append(f"Added bleed resistor: {line.strip()}")
+
+        if not insertions:
+            QMessageBox.information(self, "Nothing to fix",
+                                    "No auto-fixable issues detected in the last analysis.")
+            self._apply_fixes_btn.hide()
+            return
+
+        # Confirm with user
+        msg = (f"Apply the following fixes to:\n{os.path.basename(path)}\n\n" +
+               "\n".join(f"  \u2022 {a}" for a in applied) +
+               "\n\nA backup (.bak) will be created first.")
+        reply = QMessageBox.question(self, "Apply Fixes?", msg,
+                                     QMessageBox.Yes | QMessageBox.No)
+        if reply != QMessageBox.Yes:
+            return
+
+        # Backup original
+        import shutil
+        try:
+            shutil.copy2(path, path + ".bak")
+        except Exception:
+            pass
+
+        # Insert before .end (or append)
+        new_lines = []
+        inserted  = False
+        for line in lines:
+            if line.strip().lower() == ".end" and not inserted:
+                new_lines.append("* [COPILOT AUTO-FIX]\n")
+                new_lines.extend(insertions)
+                inserted = True
+            new_lines.append(line)
+        if not inserted:
+            new_lines.append("\n* [COPILOT AUTO-FIX]\n")
+            new_lines.extend(insertions)
+            new_lines.append(".end\n")
+
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.writelines(new_lines)
+        except Exception as e:
+            QMessageBox.warning(self, "Write error", f"Failed to write file:\n{e}")
+            return
+
+        self._apply_fixes_btn.hide()
+        self._last_netlist_path = None
+        self._last_facts = {}
+        self.append_message(
+            "eSim",
+            (f"Applied {len(applied)} fix(es) to {os.path.basename(path)}:\n" +
+             "\n".join(f"  \u2022 {a}" for a in applied) +
+             "\n\nBackup saved as .bak — run simulation to verify."),
+            is_user=False,
+        )
+
+    # ==================== PRIORITY 4 & 7: BATCH ANALYSIS ====================
+
+    def analyze_batch_files(self):
+        """Let user pick multiple netlists or images for batch static analysis."""
+        if self.is_bot_busy():
+            return
+
+        dlg = QMessageBox(self)
+        dlg.setWindowTitle("Batch Analysis")
+        dlg.setText("Select the type of files to batch analyze:")
+        netlist_btn = dlg.addButton("Netlists (.cir / .cir.out)", QMessageBox.AcceptRole)
+        image_btn   = dlg.addButton("Images (.png / .jpg)",        QMessageBox.AcceptRole)
+        dlg.addButton("Cancel",                                     QMessageBox.RejectRole)
+        dlg.exec_()
+
+        clicked = dlg.clickedButton()
+        if clicked == netlist_btn:
+            files, _ = QFileDialog.getOpenFileNames(
+                self, "Select Netlist Files", "",
+                "Netlists (*.cir *.cir.out *.net);;All Files (*)"
+            )
+            if files:
+                self._run_batch_analysis("netlist", files)
+        elif clicked == image_btn:
+            files, _ = QFileDialog.getOpenFileNames(
+                self, "Select Image Files", "",
+                "Images (*.png *.jpg *.jpeg *.bmp *.tiff);;All Files (*)"
+            )
+            if files:
+                QMessageBox.information(
+                    self, "Vision batch",
+                    f"Queuing {len(files)} image(s) for vision analysis.\n"
+                    "This may take several minutes.",
+                )
+                self._run_batch_analysis("image", files)
+
+    def _run_batch_analysis(self, mode: str, file_paths: list):
+        """Start BatchWorker and stream progress into the chat."""
+        total = len(file_paths)
+        label = "netlist(s)" if mode == "netlist" else "image(s)"
+        self.append_message(
+            "eSim",
+            f"Starting batch analysis of {total} {label}…",
+            is_user=False,
+        )
+
+        self._disable_ui_for_analysis()
+        self.loading_label.show()
+        self._apply_fixes_btn.hide()
+
+        self._batch_worker = BatchWorker(mode, file_paths)
+        self._batch_worker.file_started.connect(self._on_batch_file_started)
+        self._batch_worker.all_done.connect(lambda results: self._on_batch_done(results, mode))
+        self._batch_worker.finished.connect(self._on_batch_worker_finished)
+        self._batch_worker.start()
+
+    def _disable_ui_for_analysis(self):
+        for attr in ("input_field", "send_btn", "attach_btn", "mic_btn",
+                     "analyze_netlist_btn", "clear_btn", "batch_btn"):
+            w = getattr(self, attr, None)
+            if w:
+                w.setDisabled(True)
+
+    def _enable_ui_after_analysis(self):
+        for attr in ("input_field", "send_btn", "attach_btn", "mic_btn",
+                     "analyze_netlist_btn", "clear_btn", "batch_btn"):
+            w = getattr(self, attr, None)
+            if w:
+                w.setEnabled(True)
+
+    def _on_batch_file_started(self, idx: int, total: int, name: str):
+        self.loading_label.setText(f"⏳ Analyzing {idx}/{total}: {name}…")
+
+    def _on_batch_done(self, results: list, mode: str):
+        label = "Netlist" if mode == "netlist" else "Image"
+        lines = [f"**Batch {label} Analysis — {len(results)} file(s)**\n"]
+        ok_count  = sum(1 for _, s in results if s.startswith("OK"))
+        err_count = len(results) - ok_count
+        for name, summary in results:
+            icon = "OK" if summary.startswith("OK") else "ISSUES"
+            lines.append(f"[{icon}] {name}: {summary}")
+        lines.append(f"\nSummary: {ok_count} OK, {err_count} with issues.")
+        self.append_message("eSim", "\n".join(lines), is_user=False)
+
+    def _on_batch_worker_finished(self):
+        self.loading_label.setText("⏳ eSim Copilot is thinking…")
+        self.loading_label.hide()
+        self._enable_ui_after_analysis()
+        self.input_field.setFocus()
+
+    # ==================== PRIORITY 5: MODEL SETTINGS ====================
+
+    def open_settings(self):
+        """Open the model-selection settings dialog."""
+        from chatbot.ollama_runner import (
+            list_available_models, save_model_settings, reload_model_settings,
+            TEXT_MODELS, VISION_MODELS,
+        )
+        import chatbot.ollama_runner as runner
+
+        dlg = CopilotSettingsDialog(
+            current_text   = TEXT_MODELS.get("default", "qwen2.5:3b"),
+            current_vision = VISION_MODELS.get("primary", "minicpm-v:latest"),
+            parent         = self,
+        )
+        if dlg.exec_() == QDialog.Accepted:
+            text_m, vis_m = dlg.get_selections()
+            save_model_settings(text_m, vis_m)
+            runner.TEXT_MODELS["default"]   = text_m
+            runner.VISION_MODELS["primary"] = vis_m
+            self.append_message(
+                "eSim",
+                f"Model settings saved:\n  Text/reasoning: {text_m}\n  Vision: {vis_m}",
+                is_user=False,
+            )
+
+    # ==================== PRIORITY 8: REAL-TIME KICAD HINTS ====================
+
+    def toggle_kicad_watch(self):
+        """Start / stop the real-time hints watcher."""
+        if self._watch_active:
+            self._watch_timer.stop()
+            self._watch_active = False
+            self.watch_btn.setStyleSheet("""
+                QPushButton {
+                    background-color: transparent;
+                    border: 1px solid #ddd;
+                    border-radius: 15px;
+                    font-size: 14px;
+                }
+                QPushButton:hover { background-color: #e3f2fd; border-color: #2196f3; }
+            """)
+            self.watch_btn.setToolTip("Toggle real-time hints (polls active project every 30 s)")
+            self.append_message("eSim", "Real-time hints: OFF", is_user=False)
+        else:
+            self._watch_active = True
+            self._watch_last_facts = None
+            self.watch_btn.setStyleSheet("""
+                QPushButton {
+                    background-color: #2196f3;
+                    color: white;
+                    border-radius: 15px;
+                    font-size: 14px;
+                }
+                QPushButton:hover { background-color: #1565c0; }
+            """)
+            self.watch_btn.setToolTip("Real-time hints: ON — click to disable")
+            self.append_message(
+                "eSim",
+                "Real-time hints: ON\nPolling active project every 30 s for static issues "
+                "(no LLM call — instant feedback).",
+                is_user=False,
+            )
+            self._kicad_watch_tick()      # run immediately
+            self._watch_timer.start()
+
+    def _kicad_watch_tick(self):
+        """Timer callback: run FACT detectors on active project without calling the LLM."""
+        try:
+            from configuration.Appconfig import Appconfig
+            proj_dir = Appconfig().current_project.get("ProjectName")
+            if not proj_dir or not os.path.isdir(proj_dir):
+                return
+
+            proj_name = os.path.basename(proj_dir)
+            # Prefer .cir (pre-simulation) over .cir.out
+            candidates = [
+                os.path.join(proj_dir, proj_name + ".cir"),
+                os.path.join(proj_dir, proj_name + ".cir.out"),
+            ]
+            netlist_path = next((p for p in candidates if os.path.exists(p)), None)
+            if not netlist_path:
+                return
+
+            with open(netlist_path, "r", encoding="utf-8", errors="ignore") as f:
+                text = f.read()
+
+            floating  = _detect_floating_nodes(text)
+            missing_m = _detect_missing_models(text)
+            has_n0, has_gnd = _netlist_ground_info(text)
+
+            new_facts = {
+                "no_ground":      not has_n0 and not has_gnd,
+                "floating":       tuple(n for n, _, _ in floating),
+                "missing_models": tuple(m for m, _ in missing_m),
+            }
+
+            if new_facts == self._watch_last_facts:
+                return  # nothing changed
+
+            self._watch_last_facts = new_facts
+
+            hints = []
+            fname = os.path.basename(netlist_path)
+            if new_facts["no_ground"]:
+                hints.append("  No ground reference (node 0)")
+            for node in new_facts["floating"]:
+                hints.append(f"  Floating node: {node}")
+            for model in new_facts["missing_models"]:
+                hints.append(f"  Missing model: {model}")
+
+            if hints:
+                self.append_message(
+                    "Hints",
+                    f"[{fname}]\n" + "\n".join(hints),
+                    is_user=False,
+                )
+            else:
+                self.append_message(
+                    "Hints",
+                    f"[{fname}] No static issues detected.",
+                    is_user=False,
+                )
+        except Exception as e:
+            print(f"[WATCH TICK] {e}")
+
     # ---------- CLEAN SHUTDOWN ----------
 
     def closeEvent(self, event):
         """Stop analysis when the chatbot window/dock is closed."""
-        # Ensure worker is stopped so it doesn't keep using CPU
         self.stop_analysis()
-
-        # Clear backend context as well
+        if self._watch_active:
+            self._watch_timer.stop()
+        if self._batch_worker and self._batch_worker.isRunning():
+            self._batch_worker.quit()
+            self._batch_worker.wait(300)
         try:
             clear_history()
         except Exception:
             pass
-
         event.accept()
 
     def debug_error(self, error_log_path: str):
@@ -1584,6 +2112,94 @@ class ChatbotGUI(QWidget):
         )
         self.worker.finished.connect(self.on_worker_finished)
         self.worker.start()
+
+# ==================== MODULE-LEVEL HELPERS ====================
+
+def _model_stub(model_name: str) -> str:
+    """Return a minimal SPICE .model stub inferred from the model name."""
+    n = model_name.upper()
+    if "PNP" in n:
+        return f".model {model_name} PNP(Is=1e-14 Bf=200 Vaf=100)"
+    if "NPN" in n or n.startswith("Q2N") or n.startswith("BC") or n.startswith("2N"):
+        return f".model {model_name} NPN(Is=1e-14 Bf=200 Vaf=100)"
+    if n.startswith("1N") or "DIODE" in n or (n.startswith("D") and len(n) <= 8):
+        return f".model {model_name} D(Is=1e-14 Rs=1)"
+    if "NMOS" in n or n.startswith("NMOS"):
+        return f".model {model_name} NMOS(Kp=120u Vto=1.0 Gamma=0)"
+    if "PMOS" in n or n.startswith("PMOS"):
+        return f".model {model_name} PMOS(Kp=60u Vto=-1.0 Gamma=0)"
+    # Default: assume NPN BJT
+    return f".model {model_name} NPN(Is=1e-14 Bf=200 Vaf=100)"
+
+
+# ==================== SETTINGS DIALOG ====================
+
+class CopilotSettingsDialog(QDialog):
+    """Simple dialog for choosing text and vision models."""
+
+    def __init__(self, current_text: str, current_vision: str, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("eSim Copilot — Model Settings")
+        self.setMinimumWidth(400)
+        self.setModal(True)
+
+        from chatbot.ollama_runner import list_available_models
+        available = list_available_models()
+
+        # Ensure current selections appear even if Ollama is offline
+        for m in (current_text, current_vision):
+            if m not in available:
+                available.insert(0, m)
+
+        layout = QVBoxLayout(self)
+
+        title = QLabel("Select AI models served by Ollama")
+        title.setStyleSheet("font-weight: bold; font-size: 13px; margin-bottom: 6px;")
+        layout.addWidget(title)
+
+        form = QFormLayout()
+
+        self._text_combo = QComboBox()
+        self._text_combo.addItems(available)
+        idx = self._text_combo.findText(current_text)
+        if idx >= 0:
+            self._text_combo.setCurrentIndex(idx)
+        form.addRow("Text / Reasoning model:", self._text_combo)
+
+        self._vision_combo = QComboBox()
+        self._vision_combo.addItems(available)
+        idx = self._vision_combo.findText(current_vision)
+        if idx >= 0:
+            self._vision_combo.setCurrentIndex(idx)
+        form.addRow("Vision model:", self._vision_combo)
+
+        layout.addLayout(form)
+
+        note = QLabel(
+            "Changes take effect immediately.\n"
+            "Models must already be pulled in Ollama\n"
+            "(e.g. ollama pull qwen2.5:3b)."
+        )
+        note.setStyleSheet("color: #666; font-size: 11px; margin-top: 6px;")
+        layout.addWidget(note)
+
+        btn_row = QHBoxLayout()
+        save_btn   = QPushButton("Save")
+        cancel_btn = QPushButton("Cancel")
+        save_btn.setDefault(True)
+        save_btn.clicked.connect(self.accept)
+        cancel_btn.clicked.connect(self.reject)
+        btn_row.addStretch()
+        btn_row.addWidget(save_btn)
+        btn_row.addWidget(cancel_btn)
+        layout.addLayout(btn_row)
+
+    def get_selections(self):
+        """Return (text_model, vision_model) chosen by the user."""
+        return self._text_combo.currentText(), self._vision_combo.currentText()
+
+
+# ==================== DOCK FACTORY ====================
 
 from PyQt5.QtWidgets import QDockWidget
 from PyQt5.QtCore import Qt
